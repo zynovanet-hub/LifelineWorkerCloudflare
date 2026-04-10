@@ -12,6 +12,8 @@ const DEFAULT_UPLOAD_EXPIRY_SECONDS = 300;
 const MAX_UPLOAD_EXPIRY_SECONDS = 3600;
 const MAX_EMERGENCY_SIZE_BYTES = 60 * 1024 * 1024;
 const MAX_EMERGENCY_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_STORAGE_WEBP_SIZE_BYTES = 1 * 1024 * 1024;
+const ALLOWED_EXTENSIONS = new Set(['.webp', '.mp4', '.md', '.xml']);
 
 function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -98,11 +100,16 @@ async function decryptAndValidateUploadToken(rawToken: string, env: Env) {
   }
 }
 
-function buildObjectName(source: string) {
-  const normalized = normalizeObjectKey(source);
-  const lastSegment = normalized.split('/').filter(Boolean).pop() || 'upload.bin';
-  const safeName = lastSegment.replace(/[^a-zA-Z0-9._-]/g, '_') || 'upload.bin';
-  return `uploads/${crypto.randomUUID()}-${safeName}`;
+function normalizeAllowedExtension(value: string) {
+  const ext = value.trim().toLowerCase();
+  if (!ALLOWED_EXTENSIONS.has(ext)) {
+    return '';
+  }
+  return ext;
+}
+
+function buildObjectNameWithExtension(extension: string) {
+  return `${crypto.randomUUID()}${extension}`;
 }
 
 async function createUploadSignedUrl(
@@ -219,6 +226,33 @@ async function cleanupEmergencyBucket(bucket: R2Bucket) {
   };
 }
 
+async function cleanupLargeWebpInStorage(bucket: R2Bucket) {
+  let cursor: string | undefined;
+  const deletedKeys: string[] = [];
+
+  do {
+    const listed = await bucket.list({ cursor });
+    cursor = listed.truncated ? listed.cursor : undefined;
+
+    for (const object of listed.objects) {
+      const isWebp = object.key.toLowerCase().endsWith('.webp');
+      const isTooLarge = object.size > MAX_STORAGE_WEBP_SIZE_BYTES;
+
+      if (!isWebp || !isTooLarge) {
+        continue;
+      }
+
+      await bucket.delete(object.key);
+      deletedKeys.push(object.key);
+    }
+  } while (cursor);
+
+  return {
+    deleted: deletedKeys.length,
+    deletedKeys,
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
@@ -226,8 +260,12 @@ export default {
 
     if (pathname === '/health' && request.method === 'GET') {
       try {
-        const cleanup = await cleanupEmergencyBucket(env.emergency);
-        if (cleanup.deleted > 0) {
+        const [emergencyCleanup, storageCleanup] = await Promise.all([
+          cleanupEmergencyBucket(env.emergency),
+          cleanupLargeWebpInStorage(env.storage),
+        ]);
+
+        if (emergencyCleanup.deleted > 0 || storageCleanup.deleted > 0) {
           return jsonResponse({ status: 'okay' });
         }
         return jsonResponse({ status: 'success' });
@@ -235,34 +273,6 @@ export default {
         console.error('Emergency bucket cleanup failed:', error);
         return jsonResponse({ ok: false, error: 'Emergency cleanup failed' }, 500);
       }
-    }
-
-    if (pathname === '/storage-object' && request.method === 'POST') {
-      let rawInput = '';
-      try {
-        rawInput = await request.text();
-      } catch {
-        return new Response('Invalid request body', { status: 400 });
-      }
-
-      const key = normalizeObjectKey(rawInput || url.searchParams.get('url') || '');
-      if (!key) {
-        return new Response('Missing object URL or key', { status: 400 });
-      }
-
-      const object = await env.storage.get(key);
-      if (!object) {
-        return new Response('Object not found', { status: 404 });
-      }
-
-      const headers = new Headers();
-      object.writeHttpMetadata(headers);
-      headers.set('etag', object.httpEtag);
-
-      return new Response(object.body, {
-        status: 200,
-        headers,
-      });
     }
 
     if (pathname === '/storage-object' && request.method === 'GET') {
@@ -318,16 +328,11 @@ export default {
         });
       }
 
-      const source =
-        (typeof body.url === 'string' && body.url) ||
-        (typeof body.key === 'string' && body.key) ||
-        (typeof body.name === 'string' && body.name) ||
-        (typeof body.objectName === 'string' && body.objectName) ||
-        '';
-
-      if (!source.trim()) {
+      const extensionRaw = typeof body.extension === 'string' ? body.extension : '';
+      const extension = normalizeAllowedExtension(extensionRaw);
+      if (!extension) {
         return jsonResponse(
-          { ok: false, error: 'Provide one of: url, key, name, or objectName in the JSON body' },
+          { ok: false, error: 'extension is required and must be one of: .webp, .mp4, .md, .xml' },
           400,
         );
       }
@@ -338,7 +343,7 @@ export default {
         : DEFAULT_UPLOAD_EXPIRY_SECONDS;
 
       const contentType = typeof body.contentType === 'string' ? body.contentType : undefined;
-      const objectName = buildObjectName(source);
+      const objectName = buildObjectNameWithExtension(extension);
 
       try {
         const uploadUrl = await createUploadSignedUrl(env.storage, objectName, expiresInSeconds, contentType);
@@ -355,6 +360,57 @@ export default {
         console.error('Failed to create upload signed URL:', error);
         return new Response('Failed to generate signed URL', { status: 500 });
       }
+    }
+
+    if (pathname === '/delete-storage-object' && request.method === 'POST') {
+      const token = extractToken(request);
+      if (!token) {
+        return new Response('Missing token', { status: 401 });
+      }
+
+      const tokenPayloadOrResponse = await decryptAndValidateUploadToken(token, env);
+      if (tokenPayloadOrResponse instanceof Response) {
+        return tokenPayloadOrResponse;
+      }
+
+      if (!tokenPayloadOrResponse.sub || !tokenPayloadOrResponse.iss) {
+        return new Response('Invalid token', { status: 401 });
+      }
+
+      let body: Record<string, unknown> = {};
+      try {
+        body = (await request.json()) as Record<string, unknown>;
+      } catch {
+        return new Response('Invalid JSON body', { status: 400 });
+      }
+
+      if (
+        typeof body.token === 'string' ||
+        typeof body.uploadToken === 'string' ||
+        typeof body.authToken === 'string'
+      ) {
+        return new Response('Token must be sent in Authorization or x-upload-token header only', {
+          status: 400,
+        });
+      }
+
+      const objectInput =
+        (typeof body.url === 'string' && body.url) ||
+        (typeof body.key === 'string' && body.key) ||
+        (typeof body.name === 'string' && body.name) ||
+        (typeof body.objectName === 'string' && body.objectName) ||
+        '';
+
+      const key = normalizeObjectKey(objectInput);
+      if (!key) {
+        return jsonResponse(
+          { ok: false, error: 'Provide one of: url, key, name, or objectName in the JSON body' },
+          400,
+        );
+      }
+
+      await env.storage.delete(key);
+      return jsonResponse({ ok: true, deletedKey: key });
     }
 
     return new Response('Not found', { status: 404 });

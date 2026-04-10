@@ -12,4 +12,4 @@ bucket_name = "storage"
 
 [[r2_buckets]]
 binding = "emergency"
-bucket_name = "Emergency"
+bucket_name = "emergency"
