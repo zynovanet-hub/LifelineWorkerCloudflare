@@ -1,7 +1,11 @@
+import { compactDecrypt, importJWK, jwtVerify } from 'jose';
+
 type Env = {
   storage: R2Bucket;
   emergency: R2Bucket;
-  UPLOAD_SIGN_TOKEN?: string;
+  CLOUD_JWE_SECRET?: string;
+  CLOUD_JWS_SECRET?: string;
+  UPLOAD_TOKEN_ISSUER?: string;
 };
 
 const DEFAULT_UPLOAD_EXPIRY_SECONDS = 300;
@@ -34,6 +38,64 @@ function extractToken(request: Request) {
   const auth = request.headers.get('Authorization') || request.headers.get('x-upload-token') || '';
   if (!auth) return '';
   return auth.startsWith('Bearer ') ? auth.slice(7).trim() : auth.trim();
+}
+
+function toBase64Url(input: string) {
+  const bytes = new TextEncoder().encode(input);
+  let binary = '';
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  const b64 = btoa(binary);
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+type UploadTokenPayload = {
+  sub: string;
+  iat: number;
+  exp: number;
+  iss: string;
+};
+
+async function decryptAndValidateUploadToken(rawToken: string, env: Env) {
+  if (!env.CLOUD_JWE_SECRET || !env.CLOUD_JWS_SECRET) {
+    return new Response('Server misconfigured (CLOUD_JWE_SECRET or CLOUD_JWS_SECRET missing)', {
+      status: 500,
+    });
+  }
+
+  try {
+    const jweKey = await importJWK({ kty: 'oct', k: toBase64Url(env.CLOUD_JWE_SECRET) }, 'dir');
+    const decrypted = await compactDecrypt(rawToken, jweKey);
+    const signedToken = new TextDecoder().decode(decrypted.plaintext);
+
+    const jwsKey = await importJWK({ kty: 'oct', k: toBase64Url(env.CLOUD_JWS_SECRET) }, 'HS256');
+    const verifyOptions = env.UPLOAD_TOKEN_ISSUER ? { issuer: env.UPLOAD_TOKEN_ISSUER } : undefined;
+    const { payload } = await jwtVerify(signedToken, jwsKey, verifyOptions);
+
+    if (typeof payload.sub !== 'string' || !payload.sub.trim()) {
+      return new Response('Invalid token: sub is required', { status: 401 });
+    }
+    if (typeof payload.iss !== 'string' || !payload.iss.trim()) {
+      return new Response('Invalid token: iss is required', { status: 401 });
+    }
+    if (typeof payload.iat !== 'number' || !Number.isInteger(payload.iat)) {
+      return new Response('Invalid token: iat must be an integer', { status: 401 });
+    }
+    if (typeof payload.exp !== 'number' || !Number.isInteger(payload.exp)) {
+      return new Response('Invalid token: exp must be an integer', { status: 401 });
+    }
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (payload.exp <= nowSeconds) {
+      return new Response('Token expired', { status: 401 });
+    }
+
+    return payload as UploadTokenPayload;
+  } catch (error) {
+    console.error('Upload token validation failed:', error);
+    return new Response('Invalid token', { status: 401 });
+  }
 }
 
 function buildObjectName(source: string) {
@@ -225,12 +287,17 @@ export default {
     }
 
     if (pathname === '/upload-sign-url' && request.method === 'POST') {
-      if (!env.UPLOAD_SIGN_TOKEN) {
-        return new Response('Server misconfigured (UPLOAD_SIGN_TOKEN missing)', { status: 500 });
+      const token = extractToken(request);
+      if (!token) {
+        return new Response('Missing token', { status: 401 });
       }
 
-      const token = extractToken(request);
-      if (!token || token !== env.UPLOAD_SIGN_TOKEN) {
+      const tokenPayloadOrResponse = await decryptAndValidateUploadToken(token, env);
+      if (tokenPayloadOrResponse instanceof Response) {
+        return tokenPayloadOrResponse;
+      }
+
+      if (!tokenPayloadOrResponse.sub || !tokenPayloadOrResponse.iss) {
         return new Response('Invalid token', { status: 401 });
       }
 
@@ -239,6 +306,16 @@ export default {
         body = (await request.json()) as Record<string, unknown>;
       } catch {
         return new Response('Invalid JSON body', { status: 400 });
+      }
+
+      if (
+        typeof body.token === 'string' ||
+        typeof body.uploadToken === 'string' ||
+        typeof body.authToken === 'string'
+      ) {
+        return new Response('Token must be sent in Authorization or x-upload-token header only', {
+          status: 400,
+        });
       }
 
       const source =
