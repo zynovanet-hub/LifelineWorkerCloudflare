@@ -1,0 +1,15 @@
+name = "cloudflare-worker-upload-token"
+main = "app.ts"
+compatibility_date = "2026-03-25"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+[[r2_buckets]]
+binding = "storage"
+bucket_name = "storage"
+
+[[r2_buckets]]
+binding = "emergency"
+bucket_name = "Emergency"

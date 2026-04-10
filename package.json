@@ -1,0 +1,16 @@
+{
+  "name": "cloudflare-worker-upload-token",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "publish": "wrangler publish"
+  },
+  "dependencies": {
+    "jose": "^5.0.0"
+
+  },
+  "devDependencies": {
+    "wrangler": "^4.77.0"
+  }
+}
