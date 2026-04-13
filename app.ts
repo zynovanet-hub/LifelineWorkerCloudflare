@@ -1,4 +1,5 @@
 import { compactDecrypt, importJWK, jwtVerify } from 'jose';
+import { getFirstAidGuide, getAllGuides, getEmergencyTypes } from './first_aid';
 
 type Env = {
   storage: R2Bucket;
@@ -275,6 +276,7 @@ export default {
       }
     }
 
+
     if (pathname === '/storage-object' && request.method === 'GET') {
       const key = normalizeObjectKey(url.searchParams.get('url') || '');
       if (!key) {
@@ -412,6 +414,21 @@ export default {
       await env.storage.delete(key);
       return jsonResponse({ ok: true, deletedKey: key });
     }
+
+
+    // First Aid Guide API routes
+    if (pathname.startsWith('/first-aid/guide/') && request.method === 'GET') {
+      // /first-aid/guide/{emergency_type}
+      const emergencyType = decodeURIComponent(pathname.replace('/first-aid/guide/', ''));
+      return getFirstAidGuide(emergencyType);
+    }
+    if (pathname === '/first-aid/all-guides' && request.method === 'GET') {
+      return getAllGuides();
+    }
+    if (pathname === '/first-aid/emergency-types' && request.method === 'GET') {
+      return getEmergencyTypes();
+    }
+
 
     return new Response('Not found', { status: 404 });
   },
