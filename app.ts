@@ -330,6 +330,74 @@ export default {
         });
       }
 
+      // Support single-file uploads (legacy) or multi-slot uploads.
+      const expiresCandidate = Number(body.expiresInSeconds);
+      const expiresInSeconds = Number.isFinite(expiresCandidate)
+        ? Math.max(1, Math.min(MAX_UPLOAD_EXPIRY_SECONDS, Math.floor(expiresCandidate)))
+        : DEFAULT_UPLOAD_EXPIRY_SECONDS;
+
+      const contentType = typeof body.contentType === 'string' ? body.contentType : undefined;
+
+      // Determine issued role from token `role` field (preferred) or fallback to body.issued
+      let issuedRole: 'vendor' | 'admin' | undefined;
+      if (
+        typeof (tokenPayloadOrResponse as any).role === 'string' &&
+        ((tokenPayloadOrResponse as any).role === 'vendor' || (tokenPayloadOrResponse as any).role === 'admin')
+      ) {
+        issuedRole = (tokenPayloadOrResponse as any).role as 'vendor' | 'admin';
+      } else if (typeof body.issued === 'string' && (body.issued === 'vendor' || body.issued === 'admin')) {
+        issuedRole = body.issued as 'vendor' | 'admin';
+      }
+
+      // If client provided explicit slots array -> generate multiple signed URLs
+      if (Array.isArray(body.slots)) {
+        const slots = body.slots.map(String);
+        if (slots.length !== 5) {
+          return jsonResponse({ ok: false, error: 'Provide exactly 5 slots' }, 400);
+        }
+
+        if (!issuedRole) {
+          return jsonResponse({ ok: false, error: 'Unable to determine issued role (vendor|admin)' }, 400);
+        }
+
+        const maxContentSizeBytes = issuedRole === 'vendor' ? MAX_STORAGE_WEBP_SIZE_BYTES : 50 * 1024 * 1024;
+
+        const results: Array<{ objectName: string; uploadUrl: string; maxContentSizeBytes: number }> = [];
+
+        try {
+          for (const slot of slots) {
+            if (!slot || typeof slot !== 'string') {
+              return jsonResponse({ ok: false, error: 'Invalid slot value' }, 400);
+            }
+
+            let objectName: string;
+            if (issuedRole === 'vendor') {
+              objectName = `${slot}.webp`;
+            } else {
+              // admin: slot already includes extension
+              objectName = slot;
+            }
+
+            const uploadUrlRaw = await createUploadSignedUrl(env.storage, objectName, expiresInSeconds, contentType);
+            // append max content size as query param so client can see the limit
+            try {
+              const u = new URL(String(uploadUrlRaw));
+              u.searchParams.set('maxContentSize', String(maxContentSizeBytes));
+              results.push({ objectName, uploadUrl: u.toString(), maxContentSizeBytes });
+            } catch {
+              // fallback: return raw URL and include size separately
+              results.push({ objectName, uploadUrl: String(uploadUrlRaw), maxContentSizeBytes });
+            }
+          }
+
+          return jsonResponse({ ok: true, results, method: 'PUT', expiresInSeconds, contentType: contentType || null });
+        } catch (error) {
+          console.error('Failed to create multiple upload signed URLs:', error);
+          return new Response('Failed to generate signed URLs', { status: 500 });
+        }
+      }
+
+      // Fallback to legacy single-file behavior (requires extension)
       const extensionRaw = typeof body.extension === 'string' ? body.extension : '';
       const extension = normalizeAllowedExtension(extensionRaw);
       if (!extension) {
@@ -339,12 +407,6 @@ export default {
         );
       }
 
-      const expiresCandidate = Number(body.expiresInSeconds);
-      const expiresInSeconds = Number.isFinite(expiresCandidate)
-        ? Math.max(1, Math.min(MAX_UPLOAD_EXPIRY_SECONDS, Math.floor(expiresCandidate)))
-        : DEFAULT_UPLOAD_EXPIRY_SECONDS;
-
-      const contentType = typeof body.contentType === 'string' ? body.contentType : undefined;
       const objectName = buildObjectNameWithExtension(extension);
 
       try {
